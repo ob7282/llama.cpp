@@ -48,10 +48,9 @@ jobs:
       - name: Stage Artifacts
         run: |
           New-Item -ItemType Directory -Path staging -Force
-          Get-ChildItem -Path build/bin/Release -Include *.exe,*.dll -Recurse | Copy-Item -Destination staging -Force
-          Get-ChildItem -Path build/bin -Include *.exe,*.dll -Recurse | Copy-Item -Destination staging -Force
-          Write-Host Staged binaries:
-          Get-ChildItem -Path staging
+          Get-ChildItem -Path build/bin -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll' } | Copy-Item -Destination staging -Force
+          Write-Host Staged binaries count: $( (Get-ChildItem -Path staging).Count )
+          Get-ChildItem -Path staging | Select-Object Name, Length
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
