@@ -1682,8 +1682,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                // Adaptive Confidence & Margin Gating (ob7282 optimization)
+                const float eff_p_min = params.p_min > 0.0f ? params.p_min : 0.45f;
+                const float p0 = cur_p->data[0].p;
+                const float p1 = cur_p->size > 1 ? cur_p->data[1].p : 0.0f;
+                const float margin = p0 - p1;
+
+                // Step decay: tighten requirement as draft depth increases to prevent error cascade
+                const float step_penalty = 0.05f * (float)i;
+                if (p0 < (eff_p_min + step_penalty) || (p0 < 0.65f && margin < 0.12f)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2559,7 +2566,7 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
