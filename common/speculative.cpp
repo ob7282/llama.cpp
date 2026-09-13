@@ -1749,7 +1749,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                                     result.push_back(alt_c);
                                     common_sampler_accept(smpl, alt_c, true);
 
-                                    if ((int) result.size() >= eff_n_max) {
+                                    if ((int) result.size() >= params.n_max) {
                                         drafting[seq_id] = false;
                                         n_drafting--;
                                         continue;
