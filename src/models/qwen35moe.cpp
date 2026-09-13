@@ -206,17 +206,26 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
 
-        // Post-attention norm
-        ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
-        cb(attn_post_norm, "attn_post_norm", il);
-
         // MOE FFN layer
-        cur = build_layer_ffn(attn_post_norm, il);
-        cb(cur, "ffn_out", il);
+        static const char * env_moe_skip = getenv("LLAMA_MOE_PREFILL_SKIP_LAYER");
+        const int skip_layer = env_moe_skip ? atoi(env_moe_skip) : 0;
+        if (skip_layer > 0 && il >= skip_layer && n_tokens > 32) {
+            // Late-layer prefill skip: self-attention has already computed and cached
+            // this layer's KV states. Pass residual stream through to bypass heavy 8-expert MoE FFN.
+            cur = ffn_residual;
+            cb(cur, "ffn_skip_moe", il);
+        } else {
+            // Post-attention norm
+            ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            cb(attn_post_norm, "attn_post_norm", il);
 
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
-        cb(cur, "post_moe", il);
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "ffn_out", il);
+
+            // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+            cur = ggml_add(ctx0, cur, ffn_residual);
+            cb(cur, "post_moe", il);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
