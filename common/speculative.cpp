@@ -1688,13 +1688,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float p1 = cur_p->size > 1 ? cur_p->data[1].p : 0.0f;
                 const float margin = p0 - p1;
 
-                // Step decay: tighten requirement as draft depth increases to prevent error cascade
-                const float step_penalty = 0.05f * (float)i;
-                if (p0 < (eff_p_min + step_penalty) || (p0 < 0.65f && margin < 0.12f)) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
+                // High confidence fast path: if p0 >= 0.70, exempt from step penalty to unleash burst speed
+                const bool high_confidence = (p0 >= 0.70f);
+                if (!high_confidence) {
+                    const float step_penalty = 0.04f * (float)i;
+                    if (p0 < (eff_p_min + step_penalty) || (p0 < 0.65f && margin < 0.10f)) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
 
-                    continue;
+                        continue;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
@@ -1727,8 +1730,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     common_batch_add(batch, id, dp.pos0, { seq_id }, true);
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 } else {
+                    // Autoregressive Hidden State Stabilization (beta = 0.5)
+                    // Preserves semantic anchor and maintains top-8 MoE expert routing across multi-step rollouts
+                    const float beta = 0.5f;
+                    for (int d = 0; d < n_embd; ++d) {
+                        pending_h[seq_id][d] = beta * pending_h[seq_id][d] + (1.0f - beta) * h_row[d];
+                    }
+
                     common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
