@@ -1749,20 +1749,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                                     result.push_back(alt_c);
                                     common_sampler_accept(smpl, alt_c, true);
 
-                                    if ((int) result.size() >= params.n_max) {
-                                        drafting[seq_id] = false;
-                                        n_drafting--;
-                                        continue;
-                                    }
-
-                                    common_batch_add(batch, alt_c, dp.pos0 + 2, { seq_id }, true);
-                                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
-                                    i_last[seq_id] = batch.n_tokens - 1;
+                                    // Conclude drafting cleanly with the 2 rescued tokens for immediate target verification
+                                    drafting[seq_id] = false;
+                                    n_drafting--;
                                     SPC_DBG("MTP seq_id %d Tree-2-2 rescued: alt_id=%d (p=%.2f) child=%d (p=%.2f)\n",
                                             seq_id, alt_id, branches[seq_id].alt_p, alt_c, alt_cur_p->data[0].p);
                                     continue;
                                 }
                             }
+                            // Alternative branch was also weak or decode failed; terminate drafting cleanly
+                            drafting[seq_id] = false;
+                            n_drafting--;
+                            continue;
                         }
 
                         drafting[seq_id] = false;
