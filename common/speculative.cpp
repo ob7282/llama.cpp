@@ -1748,6 +1748,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                                     const llama_token alt_c = alt_cur_p->data[0].id;
                                     result.push_back(alt_c);
                                     common_sampler_accept(smpl, alt_c, true);
+
+                                    if ((int) result.size() >= eff_n_max) {
+                                        drafting[seq_id] = false;
+                                        n_drafting--;
+                                        continue;
+                                    }
+
                                     common_batch_add(batch, alt_c, dp.pos0 + 2, { seq_id }, true);
                                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
                                     i_last[seq_id] = batch.n_tokens - 1;
@@ -1770,11 +1777,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 // Online Acceptance Controller budget check (Lever 4)
+                // Statically bounded by params.n_max to respect cparams.n_outputs_max
                 int eff_n_max = params.n_max;
                 if (alpha_ema[seq_id] < 0.35f) {
                     eff_n_max = std::max(2, params.n_max - 2);
-                } else if (alpha_ema[seq_id] > 0.75f) {
-                    eff_n_max = std::min(params.n_max + 1, 6);
                 }
 
                 if (eff_n_max <= (int) result.size()) {
@@ -1833,6 +1839,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+            }
+            if (dp.result->size() > (size_t) params.n_max) {
+                dp.result->resize(params.n_max);
             }
             last_n_drafted[seq_id] = (int) dp.result->size();
         }
