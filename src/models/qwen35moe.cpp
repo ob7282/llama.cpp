@@ -256,6 +256,51 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         // Input for next layer
         inpL = cur;
+
+        // TRUE PREFILL KV SYNTHESIS & TRUNCATION:
+        // When we have finished layer il == eff_skip_layer - 1 during prompt prefill (n_tokens > min_tokens),
+        // we synthesize KV cache for all target layers [eff_skip_layer ... n_layer - 1] in a single pass
+        // and terminate prefill computation immediately (~50% prefill compute saved).
+        static const char * env_kv_proj = getenv("LLAMA_MOE_KV_PROJECTOR");
+        const bool use_kv_proj = env_kv_proj && (strcmp(env_kv_proj, "0") != 0 && strcmp(env_kv_proj, "false") != 0 && strcmp(env_kv_proj, "off") != 0);
+
+        if (use_kv_proj && eff_skip_layer > 0 && il == eff_skip_layer - 1 && n_tokens > min_tokens) {
+            ggml_tensor * h_proj = inpL;
+
+            if (strcmp(env_kv_proj, "dense") == 0) {
+                // Mode 0: Dense linear baseline (RMSNorm normalized hidden state)
+                h_proj = build_norm(inpL, model.layers[eff_skip_layer].attn_norm, nullptr, LLM_NORM_RMS, eff_skip_layer);
+            } else if (strcmp(env_kv_proj, "moe_router") == 0) {
+                // Mode 2: Full MoE-Aware Projector (Shared Base SwiGLU + Router gating modulation)
+                ggml_tensor * attn_post_norm = build_norm(inpL, model.layers[eff_skip_layer].attn_post_norm, nullptr, LLM_NORM_RMS, eff_skip_layer);
+                ggml_tensor * ffn_proj = build_layer_projector_ffn(attn_post_norm, eff_skip_layer);
+                if (model.layers[eff_skip_layer].ffn_gate_inp != nullptr) {
+                    ggml_tensor * r_logits = build_lora_mm(model.layers[eff_skip_layer].ffn_gate_inp, attn_post_norm);
+                    ggml_tensor * r_probs  = ggml_soft_max(ctx0, r_logits);
+                    ggml_tensor * r_gate   = ggml_view_2d(ctx0, r_probs, 1, n_tokens, r_probs->nb[1], 0);
+                    ffn_proj = ggml_mul(ctx0, ffn_proj, r_gate);
+                }
+                h_proj = ggml_add(ctx0, inpL, ffn_proj);
+            } else {
+                // Mode 1: Shared Base SwiGLU Projector (default: "shared" or "1")
+                ggml_tensor * attn_post_norm = build_norm(inpL, model.layers[eff_skip_layer].attn_post_norm, nullptr, LLM_NORM_RMS, eff_skip_layer);
+                ggml_tensor * ffn_proj = build_layer_projector_ffn(attn_post_norm, eff_skip_layer);
+                h_proj = ggml_add(ctx0, inpL, ffn_proj);
+            }
+            cb(h_proj, "h_projector_base", il);
+
+            // Synthesize and write KV cache for all target layers [eff_skip_layer ... n_layer - 1]
+            for (int l = eff_skip_layer; l < n_layer; ++l) {
+                if (!hparams.is_recr(l)) {
+                    build_projected_kv(inp->get_attn(), h_proj, inp_pos, sections, l);
+                }
+                res->t_layer_inp[l] = h_proj;
+            }
+
+            // Prefill terminates here! Pass projected representation to final output norm
+            inpL = h_proj;
+            break;
+        }
     }
     cur = inpL;
 
@@ -605,6 +650,49 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_projector_ffn(ggml_tenso
         return ffn_shexp;
     }
     return cur;
+}
+
+void llama_model_qwen35moe::graph::build_projected_kv(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             h_proj,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       target_layer) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // Qwen3.5 joint QKV projection from h_proj using target_layer's native projection weights
+    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[target_layer], h_proj,
+            n_embd_head * 2, n_head,
+            n_embd_head,     n_head_kv,
+            n_embd_head,     n_head_kv,
+            target_layer, false);
+    cb(Kcur, "Kcur_proj", target_layer);
+    cb(Vcur, "Vcur_proj", target_layer);
+
+    // Apply K normalization
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[target_layer].attn_k_norm, nullptr, LLM_NORM_RMS, target_layer);
+    cb(Kcur, "Kcur_normed_proj", target_layer);
+
+    // Reshape V
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    // Apply IMRoPE to K
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
+    cb(Kcur, "Kcur_rope_proj", target_layer);
+
+    // Store directly into KV cache for target_layer
+    const auto * mctx_cur = inp->mctx;
+    const auto & k_idxs   = inp->get_k_idxs();
+    const auto & v_idxs   = inp->get_v_idxs();
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, k_idxs, target_layer));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, v_idxs, target_layer));
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE

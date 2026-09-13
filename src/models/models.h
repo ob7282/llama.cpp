@@ -2478,6 +2478,13 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        void build_projected_kv(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * h_proj,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   target_layer);
+
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,
                     ggml_tensor * weights,
