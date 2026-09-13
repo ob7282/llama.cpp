@@ -2472,7 +2472,8 @@ struct llama_model_qwen35moe : public llama_model_base {
 
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
-                            int   il);
+                            int   il,
+                            int   n_experts_override = -1);
 
         ggml_tensor * build_layer_projector_ffn(
                     ggml_tensor * cur,

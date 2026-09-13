@@ -238,13 +238,21 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         static const char * env_moe_proj = getenv("LLAMA_MOE_PROJECTOR_MODE");
         const bool use_projector = (env_moe_proj && (strcmp(env_moe_proj, "shared") == 0 || strcmp(env_moe_proj, "1") == 0)) || use_kv_proj;
 
+        static const char * env_exp_used = getenv("LLAMA_MOE_PREFILL_EXPERTS_USED");
+        const int prefill_experts_used = env_exp_used ? atoi(env_exp_used) : -1;
+
         if (is_skip_layer) {
-            if (use_projector) {
+            ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            cb(attn_post_norm, "attn_post_norm", il);
+
+            if (prefill_experts_used >= 0) {
+                // Top-N Expert Sparsity: evaluate Shared Expert + N routed specialists (e.g. N=0, 2, 4, 6, 8)
+                ggml_tensor * ffn_out = build_layer_ffn(attn_post_norm, il, prefill_experts_used);
+                cur = ggml_add(ctx0, ffn_residual, ffn_out);
+                cb(cur, "ffn_sparse_moe", il);
+            } else if (use_projector) {
                 // Shared Base MoE Projector: compute non-linear Shared Base FFN (1.0x capacity)
                 // maintaining token representation geometry while bypassing the 8 heavy routed specialists
-                ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
-                cb(attn_post_norm, "attn_post_norm", il);
-
                 ggml_tensor * ffn_proj = build_layer_projector_ffn(attn_post_norm, il);
 
                 // MoE router gating modulation if moe_router mode is active
@@ -548,26 +556,31 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, int n_experts_override) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
+    const int64_t actual_experts_used = (n_experts_override >= 0) ? n_experts_override : n_expert_used;
+
+    ggml_tensor * moe_out = nullptr;
+    if (actual_experts_used > 0) {
+        moe_out =
+            build_moe_ffn(cur,
+                model.layers[il].ffn_gate_inp,
+                model.layers[il].ffn_up_exps,
+                model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps,
+                nullptr,
+                n_expert, actual_experts_used,
+                LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                nullptr, model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
+        cb(moe_out, "ffn_moe_out", il);
+    }
 
     // Add shared experts if present - following Qwen3Next reference implementation
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -590,16 +603,21 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
 
-
         // Apply the gate to the shared expert output
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        if (moe_out != nullptr) {
+            cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        } else {
+            cur = ffn_shexp;
+        }
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;
     }
+
+    GGML_ASSERT(cur != nullptr && "Cannot skip all experts if model has no shared expert");
 
     return cur;
 }
