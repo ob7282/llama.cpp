@@ -208,12 +208,36 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         // MOE FFN layer
         static const char * env_moe_skip = getenv("LLAMA_MOE_PREFILL_SKIP_LAYER");
+        static const char * env_moe_min_tok = getenv("LLAMA_MOE_PREFILL_SKIP_MIN_TOKENS");
+        static const char * env_moe_adaptive = getenv("LLAMA_MOE_PREFILL_ADAPTIVE");
         const int skip_layer = env_moe_skip ? atoi(env_moe_skip) : 0;
-        if (skip_layer > 0 && il >= skip_layer && n_tokens > 32) {
-            // Late-layer prefill skip: self-attention has already computed and cached
-            // this layer's KV states. Pass residual stream through to bypass heavy 8-expert MoE FFN.
-            cur = ffn_residual;
-            cb(cur, "ffn_skip_moe", il);
+        const int min_tokens = env_moe_min_tok ? atoi(env_moe_min_tok) : 32;
+        int eff_skip_layer = skip_layer;
+        if (env_moe_adaptive && atoi(env_moe_adaptive) > 0 && skip_layer > 0) {
+            if (n_tokens < 256) {
+                // High-complexity / delicate boundary region: conservative preset (layer 32)
+                eff_skip_layer = std::max(skip_layer, 32);
+            }
+        }
+        static const char * env_moe_proj = getenv("LLAMA_MOE_PROJECTOR_MODE");
+        const bool use_projector = env_moe_proj && (strcmp(env_moe_proj, "shared") == 0 || strcmp(env_moe_proj, "1") == 0);
+
+        if (eff_skip_layer > 0 && il >= eff_skip_layer && n_tokens > min_tokens) {
+            if (use_projector) {
+                // Shared Base MoE Projector: compute non-linear Shared Base FFN (1.0x capacity)
+                // maintaining token representation geometry while bypassing the 8 heavy routed specialists
+                ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+                cb(attn_post_norm, "attn_post_norm", il);
+
+                ggml_tensor * ffn_proj = build_layer_projector_ffn(attn_post_norm, il);
+                cur = ggml_add(ctx0, ffn_residual, ffn_proj);
+                cb(cur, "ffn_proj_moe", il);
+            } else {
+                // Late-layer prefill skip: self-attention has already computed and cached
+                // this layer's KV states. Pass residual stream through to bypass heavy 8-expert MoE FFN.
+                cur = ffn_residual;
+                cb(cur, "ffn_skip_moe", il);
+            }
         } else {
             // Post-attention norm
             ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
@@ -553,6 +577,33 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         cur = moe_out;
     }
 
+    return cur;
+}
+
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_projector_ffn(ggml_tensor * cur, const int il) {
+    // Shared-Base MoE Projector: compute non-linear Shared Base FFN (1.0x capacity)
+    // preserving token representation geometry while bypassing the 8 heavy routed specialists
+    if (model.layers[il].ffn_up_shexp != nullptr) {
+        ggml_tensor * ffn_shexp =
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp_proj", il);
+
+        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate_proj", il);
+
+        shared_gate = ggml_sigmoid(ctx0, shared_gate);
+        cb(shared_gate, "shared_expert_gate_sigmoid_proj", il);
+
+        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+        cb(ffn_shexp, "ffn_shexp_proj_gated", il);
+
+        return ffn_shexp;
+    }
     return cur;
 }
 
