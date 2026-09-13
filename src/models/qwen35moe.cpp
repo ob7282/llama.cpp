@@ -495,13 +495,6 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    int64_t eff_expert_used = n_expert_used;
-    static const char * env_moe_prefill = getenv("LLAMA_MOE_PROJECTOR_PREFILL");
-    if (env_moe_prefill && atoi(env_moe_prefill) > 0 && ubatch.n_tokens > 32 && il >= 24) {
-        // MoE KV Projector prefill mode: dynamic micro-routing top-2 experts on upper layers
-        eff_expert_used = std::min<int64_t>(eff_expert_used, 2);
-    }
-
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -509,7 +502,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             model.layers[il].ffn_gate_exps,
             model.layers[il].ffn_down_exps,
             nullptr,
-            n_expert, eff_expert_used,
+            n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
