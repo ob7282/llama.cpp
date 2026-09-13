@@ -1363,6 +1363,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    std::vector<float>   alpha_ema;
+    std::vector<int32_t> last_n_drafted;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1441,6 +1444,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        alpha_ema.assign(n_seq, 0.70f);
+        last_n_drafted.assign(n_seq, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1610,6 +1616,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        struct branch_info {
+            bool has_alt = false;
+            llama_token alt_id = -1;
+            float alt_p = 0.0f;
+            float p0 = 0.0f;
+            std::vector<float> h_root;
+        };
+        std::vector<branch_info> branches(n_seq);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -1688,11 +1703,58 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float p1 = cur_p->size > 1 ? cur_p->data[1].p : 0.0f;
                 const float margin = p0 - p1;
 
+                // Tree-2-2 Candidate Tracking at root step (Component B)
+                if (i == 0 && p0 < 0.70f && margin <= 0.15f && cur_p->size > 1) {
+                    branches[seq_id].has_alt = true;
+                    branches[seq_id].alt_id  = cur_p->data[1].id;
+                    branches[seq_id].alt_p   = p1;
+                    branches[seq_id].p0      = p0;
+                    branches[seq_id].h_root  = pending_h[seq_id];
+                }
+
                 // High confidence fast path: if p0 >= 0.70, exempt from step penalty to unleash burst speed
                 const bool high_confidence = (p0 >= 0.70f);
                 if (!high_confidence) {
                     const float step_penalty = 0.04f * (float)i;
                     if (p0 < (eff_p_min + step_penalty) || (p0 < 0.65f && margin < 0.10f)) {
+                        // Tree-2-2 Branch Rescue: check if alternative root token can save the rollout
+                        if (i == 1 && branches[seq_id].has_alt && !chain_heads && !is_mem_shared) {
+                            branches[seq_id].has_alt = false;
+                            auto * mem_dft = llama_get_memory(ctx_dft);
+                            llama_memory_seq_rm(mem_dft, seq_id, dp.pos0 + 1, -1);
+                            result.pop_back(); // drop weak primary token
+                            pending_h[seq_id] = branches[seq_id].h_root; // rewind hidden state
+
+                            const llama_token alt_id = branches[seq_id].alt_id;
+                            common_batch_clear(batch);
+                            common_batch_add(batch, alt_id, dp.pos0 + 1, { seq_id }, true);
+                            std::memcpy(batch.embd, pending_h[seq_id].data(), row_bytes);
+
+                            int ret_alt = llama_decode(ctx_dft, batch);
+                            if (ret_alt == 0) {
+                                common_sampler_sample(smpl, ctx_dft, 0, true);
+                                const auto * alt_cur_p = common_sampler_get_candidates(smpl, true);
+                                if (alt_cur_p->size > 0 && alt_cur_p->data[0].p >= eff_p_min) {
+                                    result.push_back(alt_id);
+                                    common_sampler_accept(smpl, alt_id, true);
+                                    const float * alt_h = llama_get_embeddings_nextn_ith(ctx_dft, 0);
+                                    const float beta = 0.5f;
+                                    for (int d = 0; d < n_embd; ++d) {
+                                        pending_h[seq_id][d] = beta * pending_h[seq_id][d] + (1.0f - beta) * alt_h[d];
+                                    }
+                                    const llama_token alt_c = alt_cur_p->data[0].id;
+                                    result.push_back(alt_c);
+                                    common_sampler_accept(smpl, alt_c, true);
+                                    common_batch_add(batch, alt_c, dp.pos0 + 2, { seq_id }, true);
+                                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+                                    i_last[seq_id] = batch.n_tokens - 1;
+                                    SPC_DBG("MTP seq_id %d Tree-2-2 rescued: alt_id=%d (p=%.2f) child=%d (p=%.2f)\n",
+                                            seq_id, alt_id, branches[seq_id].alt_p, alt_c, alt_cur_p->data[0].p);
+                                    continue;
+                                }
+                            }
+                        }
+
                         drafting[seq_id] = false;
                         n_drafting--;
 
@@ -1707,7 +1769,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // Online Acceptance Controller budget check (Lever 4)
+                int eff_n_max = params.n_max;
+                if (alpha_ema[seq_id] < 0.35f) {
+                    eff_n_max = std::max(2, params.n_max - 2);
+                } else if (alpha_ema[seq_id] > 0.75f) {
+                    eff_n_max = std::min(params.n_max + 1, 6);
+                }
+
+                if (eff_n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1764,12 +1834,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+            last_n_drafted[seq_id] = (int) dp.result->size();
         }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (last_n_drafted[seq_id] > 0) {
+            const float inst_rate = (float) n_accepted / (float) last_n_drafted[seq_id];
+            alpha_ema[seq_id] = 0.85f * alpha_ema[seq_id] + 0.15f * inst_rate;
+            SPC_DBG("MTP seq_id %d accept rate: instant=%.2f, ema=%.2f (accepted %d / %d)\n",
+                    seq_id, inst_rate, alpha_ema[seq_id], (int)n_accepted, last_n_drafted[seq_id]);
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
