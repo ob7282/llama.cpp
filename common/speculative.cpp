@@ -1721,7 +1721,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const float step_penalty = 0.04f * (float)i;
                     if (p0 < (eff_p_min + step_penalty) || (p0 < 0.65f && margin < 0.10f)) {
                         // Tree-2-2 Branch Rescue: check if alternative root token can save the rollout
-                        if (i == 1 && branches[seq_id].has_alt && !chain_heads && !is_mem_shared) {
+                        if (i == 1 && branches[seq_id].has_alt && !chain_heads) {
                             branches[seq_id].has_alt = false;
                             auto * mem_dft = llama_get_memory(ctx_dft);
                             llama_memory_seq_rm(mem_dft, seq_id, dp.pos0 + 1, -1);
